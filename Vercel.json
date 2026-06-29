@@ -1,5 +1,75 @@
-{
-  "version": 2,
-  "builds": [{ "src": "server.js", "use": "@vercel/node" }],
-  "routes": [{ "src": "/(.*)", "dest": "server.js" }]
+const https = require("https");
+
+let _accessToken = null;
+let _tokenExpiry = 0;
+
+async function getAccessToken() {
+  if (_accessToken && Date.now() < _tokenExpiry) return _accessToken;
+  const params = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: process.env.ZOHO_CLIENT_ID,
+    client_secret: process.env.ZOHO_CLIENT_SECRET,
+    refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+  });
+  const res = await fetch(`https://accounts.zoho.com/oauth/v2/token?${params}`, { method: "POST" });
+  const data = await res.json();
+  _accessToken = data.access_token;
+  _tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return _accessToken;
 }
+
+async function zohoRequest(method, path, body) {
+  const token = await getAccessToken();
+  const res = await fetch(`${process.env.ZOHO_BASE_URL}/crm/v3${path}`, {
+    method,
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+
+async function upsert(module, record, duplicateCheckFields) {
+  return zohoRequest("POST", `/${module}/upsert`, { data: [record], duplicate_check_fields: duplicateCheckFields });
+}
+
+function mapAccount(p) {
+  return { Account_Name: p.company?.name || p.caller?.name || "Unknown", Phone: p.company?.phone || p.caller?.phone, Website: p.company?.website, Description: p.notes };
+}
+
+function mapContact(p, accountId) {
+  const parts = (p.caller?.name || "").split(" ");
+  return { First_Name: parts[0] || "", Last_Name: parts.slice(1).join(" ") || parts[0] || "Unknown", Phone: p.caller?.phone, Email: p.caller?.email, Account_Name: accountId ? { id: accountId } : undefined };
+}
+
+function mapLead(p) {
+  const parts = (p.caller?.name || "").split(" ");
+  return { First_Name: parts[0] || "", Last_Name: parts.slice(1).join(" ") || parts[0] || "Unknown", Phone: p.caller?.phone, Email: p.caller?.email, Company: p.company?.name || "Unknown", Lead_Source: "Phone Call" };
+}
+
+module.exports = async (req, res) => {
+  if (req.method === "GET") { res.status(200).json({ ok: true }); return; }
+  if (req.method !== "POST") { res.status(404).end(); return; }
+  if (process.env.WEBHOOK_SECRET && req.headers["x-webhook-secret"] !== process.env.WEBHOOK_SECRET) { res.status(401).end(); return; }
+
+  const payload = req.body;
+  const log = [];
+  let accountId = null;
+
+  if (payload.company?.name) {
+    const r = await upsert("Accounts", mapAccount(payload), ["Account_Name"]);
+    accountId = r?.data?.[0]?.details?.id;
+    log.push({ module: "Account", status: r?.data?.[0]?.status, id: accountId });
+  }
+
+  if (payload.caller?.email || payload.caller?.phone) {
+    const r = await upsert("Contacts", mapContact(payload, accountId), payload.caller?.email ? ["Email"] : ["Phone"]);
+    log.push({ module: "Contact", status: r?.data?.[0]?.status, id: r?.data?.[0]?.details?.id });
+  }
+
+  if (!accountId) {
+    const r = await upsert("Leads", mapLead(payload), payload.caller?.email ? ["Email"] : ["Phone"]);
+    log.push({ module: "Lead", status: r?.data?.[0]?.status, id: r?.data?.[0]?.details?.id });
+  }
+
+  res.status(200).json({ ok: true, log });
+};
