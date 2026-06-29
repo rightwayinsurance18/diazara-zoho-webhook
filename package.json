@@ -1,0 +1,13 @@
+{
+  "name": "diazara-zoho-webhook",
+  "version": "1.0.0",
+  "description": "Webhook server: Diazara calls → Zoho CRM Accounts, Contacts, Leads",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
